@@ -1,0 +1,1602 @@
+# OpenSearch jVector 插件深度解析
+
+本文档面向 Lucene 和 OpenSearch 初学者，详细讲解 opensearch-jvector 插件的内部工作原理。
+
+---
+
+# 第一章：写入流程详解
+
+## 1.1 整体架构概览
+
+在深入细节之前，先建立一个全局视角。当用户向 OpenSearch 写入一个包含向量字段的文档时，数据会经过以下层次：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    用户请求层                                    │
+│  PUT /my-index/_doc/1 { "my_vector": [0.1, 0.2, ...] }          │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                  OpenSearch 索引层                               │
+│  IndexRequest → IndexingOperation → Engine.index()              │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Lucene 索引层                                 │
+│  IndexWriter → DocumentsWriter → IndexingChain                  │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   字段处理层                                     │
+│  KNNVectorFieldMapper.parseCreateField()                        │
+│  创建 KnnFloatVectorField (Lucene 的向量字段类型)                 │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                  Codec 层 (核心!)                                │
+│  JVectorFormat → JVectorWriter                                  │
+│  ├── addField(): 接收向量数据                                    │
+│  ├── flush(): 内存 → 磁盘段                                      │
+│  └── mergeOneField(): 段合并                                     │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                  jVector 库层                                    │
+│  GraphIndexBuilder (构建 HNSW 图)                                │
+│  ProductQuantization (向量压缩)                                  │
+│  OnDiskSequentialGraphIndexWriter (持久化)                       │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    存储层                                        │
+│  .meta-jvector     (元数据文件)                                  │
+│  .data-jvector     (图索引 + 向量数据)                           │
+│  .neighbors-score-cache-jvector (邻居缓存，用于增量合并)          │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 1.2 Lucene Codec 机制简介
+
+### 1.2.1 什么是 Codec？
+
+Lucene 的 Codec（编解码器）是一个可插拔的组件，负责定义数据如何被写入磁盘和从磁盘读取。你可以把它理解为 Lucene 的"存储驱动"。
+
+```
+Codec
+├── PostingsFormat      → 倒排索引的存储格式
+├── DocValuesFormat     → 列式存储的格式
+├── StoredFieldsFormat  → 原始文档存储格式
+├── TermVectorsFormat   → 词向量存储格式
+├── FieldInfosFormat    → 字段元信息格式
+├── SegmentInfoFormat   → 段元信息格式
+├── NormsFormat         → 归一化因子格式
+├── LiveDocsFormat      → 删除标记格式
+├── CompoundFormat      → 复合文件格式
+└── KnnVectorsFormat    → 向量索引格式 ← 这就是我们要替换的！
+```
+
+### 1.2.2 jVector 插件如何接入？
+
+jVector 插件通过以下方式接入 Lucene 的 Codec 体系：
+
+```java
+// 1. 插件入口注册自定义 CodecService
+public class JVectorKNNPlugin extends Plugin implements EnginePlugin {
+    @Override
+    public Optional<CodecServiceFactory> getCustomCodecServiceFactory(IndexSettings indexSettings) {
+        if (indexSettings.getValue(KNNSettings.IS_KNN_INDEX_SETTING)) {
+            return Optional.of(KNNCodecService::new);  // 使用自定义 CodecService
+        }
+        return Optional.empty();
+    }
+}
+
+// 2. KNNCodecService 返回包装后的 Codec
+public class KNNCodecService extends CodecService {
+    @Override
+    public Codec codec(String name) {
+        // 用 KNN Codec 包装用户选择的基础 Codec
+        return KNNCodecVersion.current().getKnnCodecSupplier().apply(super.codec(name), mapperService);
+    }
+}
+
+// 3. KNN Codec 只替换 KnnVectorsFormat，其他格式委托给原 Codec
+// KNN9120PerFieldKnnVectorsFormat 根据字段配置选择具体实现
+switch (knnEngine) {
+    case LUCENE:
+        return new Lucene99HnswVectorsFormat(...);  // Lucene 原生实现
+    case JVECTOR:
+        return new JVectorFormat(...);              // jVector 实现 ← 我们的主角
+}
+```
+
+## 1.3 写入阶段一：文档解析与字段映射
+
+### 1.3.1 Mapping 定义
+
+用户首先需要创建一个包含 `knn_vector` 类型字段的索引：
+
+```json
+PUT /my-index
+{
+  "settings": {
+    "index": {
+      "knn": true
+    }
+  },
+  "mappings": {
+    "properties": {
+      "my_vector": {
+        "type": "knn_vector",
+        "dimension": 128,
+        "method": {
+          "name": "disk_ann",
+          "engine": "jvector",
+          "space_type": "cosinesimil",
+          "parameters": {
+            "m": 32,
+            "ef_construction": 100
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+### 1.3.2 KNNVectorFieldMapper 的作用
+
+当文档被索引时，`KNNVectorFieldMapper` 负责：
+
+1. **解析向量数据**：从 JSON 中提取 float 数组
+2. **验证维度**：确保向量维度与 mapping 定义一致
+3. **创建 Lucene Field**：将向量包装成 `KnnFloatVectorField`
+
+```java
+// 简化的处理流程
+public class KNNVectorFieldMapper {
+    @Override
+    protected void parseCreateField(ParseContext context) throws IOException {
+        // 1. 从 JSON 解析向量
+        float[] vector = parseVector(context);
+
+        // 2. 验证维度
+        if (vector.length != dimension) {
+            throw new IllegalArgumentException("向量维度不匹配");
+        }
+
+        // 3. 创建 Lucene 向量字段
+        KnnFloatVectorField field = new KnnFloatVectorField(
+            fieldType().name(),
+            vector,
+            fieldType  // 包含相似度函数等信息
+        );
+        context.doc().add(field);
+    }
+}
+```
+
+### 1.3.3 VectorSimilarityFunction（相似度函数）
+
+向量搜索需要定义如何计算两个向量之间的"距离"或"相似度"：
+
+| space_type | 说明 | 公式 | 适用场景 |
+|------------|------|------|----------|
+| `l2` (EUCLIDEAN) | 欧几里得距离 | √Σ(aᵢ-bᵢ)² | 图像特征、地理位置 |
+| `cosinesimil` (COSINE) | 余弦相似度 | (a·b)/(‖a‖·‖b‖) | 文本嵌入、语义搜索 |
+| `innerproduct` (DOT_PRODUCT) | 点积 | Σ(aᵢ·bᵢ) | 已归一化的向量 |
+
+```
+示例：计算两个 3 维向量的相似度
+
+向量 A = [1, 2, 3]
+向量 B = [4, 5, 6]
+
+欧几里得距离 = √[(1-4)² + (2-5)² + (3-6)²] = √[9 + 9 + 9] = √27 ≈ 5.2
+
+余弦相似度 = (1×4 + 2×5 + 3×6) / (√14 × √77) = 32 / 32.86 ≈ 0.97
+
+点积 = 1×4 + 2×5 + 3×6 = 4 + 10 + 18 = 32
+```
+
+## 1.4 写入阶段二：JVectorWriter 接收数据
+
+### 1.4.1 JVectorFormat 创建 Writer
+
+当 Lucene 需要写入向量数据时，会调用 `JVectorFormat.fieldsWriter()` 创建一个 `JVectorWriter`：
+
+```java
+public class JVectorFormat extends KnnVectorsFormat {
+
+    // 关键参数
+    private final int maxConn;           // HNSW 图每个节点的最大连接数 (M)
+    private final int beamWidth;         // 构建时的搜索宽度 (ef_construction)
+    private final float alpha;           // Vamana 算法的 α 参数
+    private final int minBatchSizeForQuantization;  // 触发 PQ 量化的最小向量数
+
+    @Override
+    public KnnVectorsWriter fieldsWriter(SegmentWriteState state) throws IOException {
+        return new JVectorWriter(
+            state,
+            maxConn,
+            beamWidth,
+            neighborOverflow,
+            alpha,
+            numberOfSubspacesPerVectorSupplier,
+            minBatchSizeForQuantization,
+            hierarchyEnabled,
+            leadingSegmentMergeDisabled
+        );
+    }
+}
+```
+
+### 1.4.2 JVectorWriter 的初始化
+
+```java
+public class JVectorWriter extends KnnVectorsWriter {
+
+    private final List<FieldWriter<?>> fields = new ArrayList<>();  // 存储各字段的写入器
+    private final IndexOutput meta;        // 元数据输出流
+    private final IndexOutput vectorIndex; // 向量索引输出流
+
+    public JVectorWriter(SegmentWriteState state, ...) throws IOException {
+        // 创建元数据文件: {segment}_{suffix}.meta-jvector
+        String metaFileName = IndexFileNames.segmentFileName(
+            state.segmentInfo.name,
+            state.segmentSuffix,
+            JVectorFormat.META_EXTENSION  // "meta-jvector"
+        );
+        meta = state.directory.createOutput(metaFileName, state.context);
+
+        // 写入文件头 (Lucene 的标准做法，用于版本校验)
+        CodecUtil.writeIndexHeader(meta, META_CODEC_NAME, VERSION_CURRENT, ...);
+
+        // 创建向量索引文件: {segment}_{suffix}.data-jvector
+        vectorIndex = state.directory.createOutput(indexDataFileName, state.context);
+        CodecUtil.writeIndexHeader(vectorIndex, VECTOR_INDEX_CODEC_NAME, VERSION_CURRENT, ...);
+    }
+}
+```
+
+### 1.4.3 addField() - 注册向量字段
+
+每当遇到一个新的向量字段，Lucene 会调用 `addField()`：
+
+```java
+@Override
+public KnnFieldVectorsWriter<?> addField(FieldInfo fieldInfo) throws IOException {
+    // 只支持 float 向量，不支持 byte 向量
+    if (fieldInfo.getVectorEncoding() == VectorEncoding.BYTE) {
+        throw new UnsupportedOperationException(
+            "byte[] 向量不被 jVector 支持，请使用 float 向量配合 PQ 量化"
+        );
+    }
+
+    // 创建字段写入器
+    FieldWriter<?> newField = new FieldWriter<>(fieldInfo, segmentName);
+    fields.add(newField);
+    return newField;
+}
+```
+
+### 1.4.4 FieldWriter - 累积向量数据
+
+`FieldWriter` 是一个内部类，负责在内存中累积该字段的所有向量：
+
+```java
+static class FieldWriter<T> extends KnnFieldVectorsWriter<T> {
+
+    private final List<VectorFloat<?>> vectors = new ArrayList<>();  // 向量列表
+    private final List<Integer> docIds = new ArrayList<>();          // 对应的文档 ID
+    private int lastDocID = -1;
+
+    @Override
+    public void addValue(int docID, T vectorValue) throws IOException {
+        // 检查：每个文档只能有一个向量值
+        if (docID == lastDocID) {
+            throw new IllegalArgumentException("一个文档只能有一个向量值");
+        }
+
+        // 记录文档 ID（顺序对应向量的 ordinal）
+        docIds.add(docID);
+
+        // 将 float[] 转换为 jVector 的 VectorFloat 类型
+        if (vectorValue instanceof float[]) {
+            vectors.add(VECTOR_TYPE_SUPPORT.createFloatVector(vectorValue));
+        }
+
+        lastDocID = docID;
+    }
+}
+```
+
+**数据结构示意图：**
+
+```
+文档写入顺序:
+  Doc 0: vector_0 = [0.1, 0.2, 0.3, ...]
+  Doc 2: vector_1 = [0.4, 0.5, 0.6, ...]  (Doc 1 没有向量)
+  Doc 3: vector_2 = [0.7, 0.8, 0.9, ...]
+
+FieldWriter 内存状态:
+  vectors = [vector_0, vector_1, vector_2]
+  docIds  = [0,        2,        3       ]
+
+  ordinal:    0         1         2
+              ↓         ↓         ↓
+  docId:      0         2         3
+```
+
+这里引入了一个重要概念：**ordinal（序号）vs docId（文档ID）**
+
+- **ordinal**：向量在 jVector 图中的节点编号，从 0 开始连续递增
+- **docId**：Lucene 分配的文档编号，可能不连续（有些文档没有向量）
+
+这两者的映射关系由 `GraphNodeIdToDocMap` 维护，后面会详细讲解。
+
+
+## 1.5 写入阶段三：Flush - 从内存到磁盘
+
+当 Lucene 的内存缓冲区达到阈值，或者用户显式调用 refresh/flush 时，会触发 `JVectorWriter.flush()` 方法，将内存中的向量数据持久化到磁盘。
+
+### 1.5.1 Flush 流程概览
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      flush() 方法                                │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        ▼                     ▼                     ▼
+┌───────────────┐    ┌───────────────┐    ┌───────────────┐
+│ 向量数量检查   │    │ 构建 HNSW 图  │    │  写入磁盘     │
+│ >= 阈值?      │    │               │    │               │
+└───────────────┘    └───────────────┘    └───────────────┘
+        │                     │                     │
+        ▼                     ▼                     ▼
+   ┌────┴────┐          GraphIndexBuilder      writeField()
+   │         │          (并行构建)              │
+   Yes       No                                 ├── 写入图索引
+   │         │                                  ├── 写入 PQ 数据
+   ▼         ▼                                  ├── 写入元数据
+计算 PQ    使用原始                              └── 写入邻居缓存
+码本       向量打分
+```
+
+### 1.5.2 flush() 方法详解
+
+```java
+@Override
+public void flush(int maxDoc, Sorter.DocMap sortMap) throws IOException {
+    for (FieldWriter<?> field : fields) {
+        RandomAccessVectorValues ravv = field.randomAccessVectorValues;
+        FieldInfo fieldInfo = field.fieldInfo;
+
+        // ========== 步骤 1: 决定是否使用 PQ 量化 ==========
+        final BuildScoreProvider buildScoreProvider;
+        final PQVectors pqVectors;
+
+        if (ravv.size() >= minimumBatchSizeForQuantization) {
+            // 向量数量足够多，使用 PQ 量化
+            pqVectors = getPQVectors(ravv, fieldInfo);
+            buildScoreProvider = BuildScoreProvider.pqBuildScoreProvider(
+                getVectorSimilarityFunction(fieldInfo),
+                pqVectors
+            );
+        } else {
+            // 向量数量太少，使用原始向量
+            pqVectors = null;
+            buildScoreProvider = BuildScoreProvider.randomAccessScoreProvider(
+                ravv,
+                getVectorSimilarityFunction(fieldInfo)
+            );
+        }
+
+        // ========== 步骤 2: 构建 ordinal → docId 映射 ==========
+        int[] ordinalsToDocIds = new int[ravv.size()];
+        for (int ord = 0; ord < ravv.size(); ord++) {
+            ordinalsToDocIds[ord] = field.docIds.get(ord);
+        }
+        GraphNodeIdToDocMap graphNodeIdToDocMap = new GraphNodeIdToDocMap(ordinalsToDocIds);
+
+        // 如果有排序，更新映射
+        if (sortMap != null) {
+            graphNodeIdToDocMap.update(sortMap);
+        }
+
+        // ========== 步骤 3: 构建 HNSW 图 ==========
+        OnHeapGraphIndex graph = getGraph(
+            buildScoreProvider,
+            ravv,
+            fieldInfo,
+            segmentName,
+            SIMD_POOL_FLUSH  // 使用专用线程池并行构建
+        );
+
+        // ========== 步骤 4: 写入磁盘 ==========
+        writeField(fieldInfo, ravv, pqVectors, graphNodeIdToDocMap, graph);
+    }
+}
+```
+
+## 1.6 Product Quantization (PQ) 向量压缩详解
+
+### 1.6.1 为什么需要向量压缩？
+
+假设你有 100 万个 768 维的 float32 向量：
+
+```
+原始存储大小 = 1,000,000 × 768 × 4 bytes = 3.07 GB
+```
+
+这么大的数据量：
+- 内存放不下 → 无法全部加载到内存进行搜索
+- 磁盘 I/O 慢 → 每次搜索都要读取大量数据
+
+**PQ 量化可以将存储压缩 16-64 倍，同时保持较高的搜索精度！**
+
+### 1.6.2 PQ 的核心思想
+
+PQ（Product Quantization，乘积量化）的核心思想是：
+
+1. **分割**：将高维向量分成多个低维子向量
+2. **聚类**：对每个子空间独立进行 K-Means 聚类
+3. **编码**：用聚类中心的编号代替原始子向量
+
+```
+原始向量 (768 维):
+┌─────────────────────────────────────────────────────────────────┐
+│ [0.1, 0.2, ..., 0.5, 0.6, ..., 0.9, 1.0, ..., 0.3, 0.4, ...]   │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                    分成 M=192 个子空间
+                    每个子空间 768/192 = 4 维
+                              │
+                              ▼
+┌────────┐ ┌────────┐ ┌────────┐     ┌────────┐
+│子空间 0 │ │子空间 1 │ │子空间 2 │ ... │子空间191│
+│[0.1,   │ │[0.5,   │ │[0.9,   │     │[0.3,   │
+│ 0.2,   │ │ 0.6,   │ │ 1.0,   │     │ 0.4,   │
+│ 0.3,   │ │ 0.7,   │ │ 1.1,   │     │ 0.5,   │
+│ 0.4]   │ │ 0.8]   │ │ 1.2]   │     │ 0.6]   │
+└────────┘ └────────┘ └────────┘     └────────┘
+    │           │           │             │
+    ▼           ▼           ▼             ▼
+ K-Means     K-Means     K-Means      K-Means
+ 256 个      256 个      256 个       256 个
+ 聚类中心    聚类中心    聚类中心     聚类中心
+    │           │           │             │
+    ▼           ▼           ▼             ▼
+ 编码: 42    编码: 128   编码: 7      编码: 255
+    │           │           │             │
+    └───────────┴───────────┴─────────────┘
+                      │
+                      ▼
+        压缩后的向量: [42, 128, 7, ..., 255]
+        只需要 192 个 uint8 = 192 bytes!
+
+压缩比 = 768 × 4 / 192 = 16 倍
+```
+
+### 1.6.3 码本（Codebook）
+
+每个子空间的 256 个聚类中心组成该子空间的"码本"：
+
+```
+子空间 0 的码本 (256 × 4 维):
+┌─────────────────────────────────────┐
+│ 中心 0:   [0.12, 0.23, 0.31, 0.42]  │
+│ 中心 1:   [0.15, 0.26, 0.34, 0.45]  │
+│ 中心 2:   [0.18, 0.29, 0.37, 0.48]  │
+│ ...                                  │
+│ 中心 255: [0.91, 0.82, 0.73, 0.64]  │
+└─────────────────────────────────────┘
+
+总码本大小 = 192 子空间 × 256 中心 × 4 维 × 4 bytes = 768 KB
+（码本只需要存储一份，被所有向量共享）
+```
+
+### 1.6.4 getPQVectors() 方法实现
+
+```java
+private PQVectors getPQVectors(RandomAccessVectorValues ravv, FieldInfo fieldInfo) {
+    // 计算子空间数量 M（根据维度自适应）
+    int M = numberOfSubspacesPerVectorSupplier.apply(ravv.dimension());
+
+    // 每个子空间的聚类中心数（最多 256，因为用 uint8 编码）
+    int numberOfClustersPerSubspace = Math.min(256, ravv.size());
+
+    // 训练 PQ 码本（使用 K-Means++）
+    ProductQuantization pq = ProductQuantization.compute(
+        ravv,                    // 训练数据
+        M,                       // 子空间数量
+        numberOfClustersPerSubspace,  // 每个子空间的聚类数
+        vectorSimilarityFunction == EUCLIDEAN,  // 是否中心化
+        UNWEIGHTED,              // 聚类权重策略
+        SIMD_POOL_MERGE,         // SIMD 计算线程池
+        ForkJoinPool.commonPool() // 并行线程池
+    );
+
+    // 用训练好的码本编码所有向量
+    PQVectors pqVectors = PQVectors.encodeAndBuild(
+        pq,
+        ravv.size(),
+        ravv,
+        SIMD_POOL_MERGE
+    );
+
+    return pqVectors;
+}
+```
+
+### 1.6.5 子空间数量的自适应选择
+
+jVector 根据向量维度自动选择合适的子空间数量：
+
+```java
+public static int getDefaultNumberOfSubspacesPerVector(int originalDimension) {
+    int compressedBytes;
+
+    if (originalDimension <= 32) {
+        // 低维向量：压缩 4 倍
+        compressedBytes = originalDimension;
+    } else if (originalDimension <= 64) {
+        // GloVe-50 等：32 bytes
+        compressedBytes = 32;
+    } else if (originalDimension <= 200) {
+        // GloVe-100/200：压缩 2 倍
+        compressedBytes = (int) (originalDimension * 0.5);
+    } else if (originalDimension <= 400) {
+        // NYTimes-256：100 bytes
+        compressedBytes = 100;
+    } else if (originalDimension <= 768) {
+        // BERT 等：压缩 4 倍
+        compressedBytes = (int) (originalDimension * 0.25);
+    } else if (originalDimension <= 1536) {
+        // OpenAI ada-002：192 bytes（压缩 32 倍）
+        compressedBytes = 192;
+    } else {
+        // 更高维度：压缩 8 倍
+        compressedBytes = (int) (originalDimension * 0.125);
+    }
+
+    return compressedBytes;  // 返回值就是子空间数量 M
+}
+```
+
+### 1.6.6 PQ 搜索时的距离计算（ADC）
+
+搜索时，我们需要计算查询向量与数据库中每个压缩向量的距离。这里使用 **ADC（Asymmetric Distance Computation）** 技术：
+
+```
+查询向量 q (原始 768 维，未压缩)
+数据库向量 x (压缩为 192 个 uint8 编码)
+
+步骤 1: 预计算查询向量到每个码本中心的距离
+┌─────────────────────────────────────────────────────────────┐
+│ 对于每个子空间 i (0 到 191):                                 │
+│   对于每个中心 j (0 到 255):                                 │
+│     distance_table[i][j] = dist(q[i], codebook[i][j])       │
+└─────────────────────────────────────────────────────────────┘
+预计算表大小: 192 × 256 = 49,152 个 float
+
+步骤 2: 快速计算与任意压缩向量的距离
+┌─────────────────────────────────────────────────────────────┐
+│ 压缩向量 x = [42, 128, 7, ..., 255]                         │
+│                                                              │
+│ 距离 = distance_table[0][42]      // 子空间 0，编码 42      │
+│      + distance_table[1][128]     // 子空间 1，编码 128     │
+│      + distance_table[2][7]       // 子空间 2，编码 7       │
+│      + ...                                                   │
+│      + distance_table[191][255]   // 子空间 191，编码 255   │
+└─────────────────────────────────────────────────────────────┘
+只需要 192 次查表 + 192 次加法！
+```
+
+**性能对比：**
+
+| 方法 | 计算量 | 内存访问 |
+|------|--------|----------|
+| 原始向量距离 | 768 次乘法 + 767 次加法 | 读取 3072 bytes |
+| PQ + ADC | 192 次查表 + 191 次加法 | 读取 192 bytes |
+
+## 1.7 HNSW 图构建详解
+
+### 1.7.1 什么是 HNSW？
+
+HNSW（Hierarchical Navigable Small World）是一种高效的近似最近邻搜索算法。它构建一个多层的图结构：
+
+```
+Layer 2 (最稀疏):     ●───────────────────●
+                      │                   │
+                      │                   │
+Layer 1 (中等密度):   ●───●───────●───────●───●
+                      │   │       │       │   │
+                      │   │       │       │   │
+Layer 0 (最密集):     ●─●─●─●─●─●─●─●─●─●─●─●─●─●─●
+                      所有向量都在这一层
+
+搜索过程:
+1. 从最高层的入口点开始
+2. 在当前层贪心搜索，找到最近的节点
+3. 下降到下一层，继续搜索
+4. 直到到达最底层，返回 top-k 结果
+```
+
+### 1.7.2 关键参数解释
+
+| 参数 | 含义 | 默认值 | 影响 |
+|------|------|--------|------|
+| `M` (maxConn) | 每个节点的最大邻居数 | 32 | 越大→精度越高，内存越大 |
+| `ef_construction` (beamWidth) | 构建时的搜索宽度 | 100 | 越大→构建越慢，图质量越好 |
+| `alpha` | Vamana 多样性参数 | 1.2 | 控制邻居的多样性 |
+
+### 1.7.3 getGraph() 方法 - 并行图构建
+
+```java
+public OnHeapGraphIndex getGraph(
+    BuildScoreProvider buildScoreProvider,
+    RandomAccessVectorValues ravv,
+    FieldInfo fieldInfo,
+    String segmentName,
+    ForkJoinPool SIMD_POOL
+) {
+    // 创建图构建器
+    GraphIndexBuilder graphIndexBuilder = new GraphIndexBuilder(
+        buildScoreProvider,           // 打分函数（可能是 PQ 或原始向量）
+        fieldInfo.getVectorDimension(),
+        maxConn,                      // M 参数
+        beamWidth,                    // ef_construction 参数
+        degreeOverflow,               // 允许的度数溢出比例
+        alpha,                        // Vamana α 参数
+        hierarchyEnabled              // 是否启用多层结构
+    );
+
+    // 获取线程本地的向量访问器（避免并发问题）
+    var vv = ravv.threadLocalSupplier();
+
+    // ★ 并行添加所有向量到图中 ★
+    // 这是 jVector 相比 Lucene 的核心优势之一！
+    SIMD_POOL.submit(() ->
+        IntStream.range(0, ravv.size())
+            .parallel()  // 并行流
+            .forEach(ord -> {
+                graphIndexBuilder.addGraphNode(ord, vv.get().getVector(ord));
+            })
+    ).join();
+
+    // 清理：移除低质量的边，优化图结构
+    graphIndexBuilder.cleanup();
+
+    return (OnHeapGraphIndex) graphIndexBuilder.getGraph();
+}
+```
+
+### 1.7.4 为什么 jVector 可以并行构建而 Lucene 不行？
+
+**Lucene HNSW 的问题：**
+- 使用全局锁保护图结构
+- 每次插入都需要获取锁
+- 本质上是串行的
+
+**jVector 的解决方案：**
+- 使用细粒度的并发控制
+- 每个节点有独立的锁
+- 插入操作只锁定受影响的节点
+- 可以充分利用多核 CPU
+
+```
+性能对比（100,000 个 128 维向量）:
+
+Lucene HNSW:  ████████████████████████████████████████ 40 秒
+jVector:      ████████ 8 秒 (8 核并行)
+
+加速比: ~5x
+```
+
+### 1.7.5 图构建的详细过程
+
+```
+插入向量 v 到图中:
+
+1. 确定插入层级 (随机，指数分布)
+   level = floor(-ln(random()) * mL)
+   其中 mL = 1/ln(M)
+
+2. 从最高层开始，贪心搜索到最近的节点
+   ┌─────────────────────────────────────┐
+   │ Layer 2: entry → search → nearest  │
+   │                    ↓                │
+   │ Layer 1: nearest → search → nearest│
+   │                    ↓                │
+   │ Layer 0: nearest → search → nearest│
+   └─────────────────────────────────────┘
+
+3. 在每一层（从 level 到 0），选择 M 个最近邻作为邻居
+   使用 Vamana 多样性剪枝:
+   - 不只选最近的，还要选方向多样的
+   - 避免所有邻居都聚集在一个方向
+
+4. 建立双向连接
+   v.neighbors.add(neighbor)
+   neighbor.neighbors.add(v)
+
+5. 如果邻居数超过 M，进行剪枝
+   保留最有价值的 M 个邻居
+```
+
+
+## 1.8 数据持久化 - writeField() 详解
+
+### 1.8.1 写入的文件结构
+
+每个段（segment）的向量数据会写入以下文件：
+
+```
+{segment_name}_{suffix}.meta-jvector
+    └── 所有字段的元数据
+
+{segment_name}_{suffix}_{field_name}.data-jvector
+    └── 该字段的图索引 + PQ 数据
+
+{segment_name}_{suffix}_{field_name}.neighbors-score-cache-jvector
+    └── 该字段的邻居分数缓存（用于增量合并）
+```
+
+### 1.8.2 writeField() 方法流程
+
+```java
+private void writeField(
+    FieldInfo fieldInfo,
+    RandomAccessVectorValues ravv,
+    PQVectors pqVectors,
+    GraphNodeIdToDocMap graphNodeIdToDocMap,
+    OnHeapGraphIndex graph
+) throws IOException {
+
+    // ========== 1. 写入图索引和 PQ 数据 ==========
+    VectorIndexFieldMetadata metadata = writeGraph(
+        graph, ravv, fieldInfo, pqVectors, graphNodeIdToDocMap
+    );
+
+    // ========== 2. 写入字段元数据到 meta 文件 ==========
+    meta.writeInt(fieldInfo.number);  // 字段编号
+    metadata.toOutput(meta);          // 元数据详情
+
+    // ========== 3. 写入邻居分数缓存 ==========
+    String cacheFileName = baseDataFileName + "_" + fieldInfo.name
+        + "." + NEIGHBORS_SCORE_CACHE_EXTENSION;
+
+    try (IndexOutput cacheOutput = directory.createOutput(cacheFileName, context);
+         JVectorIndexWriter writer = new JVectorIndexWriter(cacheOutput)) {
+
+        CodecUtil.writeIndexHeader(cacheOutput, ...);
+        graph.save(writer);  // 保存 OnHeapGraphIndex
+        CodecUtil.writeFooter(cacheOutput);
+    }
+}
+```
+
+### 1.8.3 writeGraph() - 图索引持久化
+
+```java
+private VectorIndexFieldMetadata writeGraph(
+    OnHeapGraphIndex graph,
+    RandomAccessVectorValues ravv,
+    FieldInfo fieldInfo,
+    PQVectors pqVectors,
+    GraphNodeIdToDocMap graphNodeIdToDocMap
+) throws IOException {
+
+    String dataFileName = baseDataFileName + "_" + fieldInfo.name
+        + "." + VECTOR_INDEX_EXTENSION;
+
+    try (IndexOutput output = directory.createOutput(dataFileName, context);
+         JVectorIndexWriter writer = new JVectorIndexWriter(output)) {
+
+        // 写入 Lucene 文件头
+        CodecUtil.writeIndexHeader(output, VECTOR_INDEX_CODEC_NAME, VERSION_CURRENT, ...);
+        long startOffset = output.getFilePointer();
+
+        // ========== 写入 OnDiskGraphIndex ==========
+        // 使用 InlineVectors 特性：将原始向量内联存储在图节点中
+        try (var diskWriter = new OnDiskSequentialGraphIndexWriter.Builder(graph, writer)
+                .with(new InlineVectors(ravv.dimension()))
+                .build()) {
+
+            // 为每个节点提供向量数据
+            var suppliers = Feature.singleStateFactory(
+                FeatureId.INLINE_VECTORS,
+                nodeId -> new InlineVectors.State(ravv.getVector(nodeId))
+            );
+
+            diskWriter.write(suppliers);
+        }
+
+        long graphEndOffset = writer.position();
+
+        // ========== 写入 PQ 码本和压缩向量 ==========
+        if (pqVectors != null) {
+            pqVectors.write(writer);
+        }
+
+        CodecUtil.writeFooter(output);
+
+        // 返回元数据
+        return VectorIndexFieldMetadata.builder()
+            .fieldNumber(fieldInfo.number)
+            .vectorEncoding(fieldInfo.getVectorEncoding())
+            .vectorSimilarityFunction(fieldInfo.getVectorSimilarityFunction())
+            .vectorDimension(ravv.dimension())
+            .vectorIndexOffset(startOffset)
+            .vectorIndexLength(graphEndOffset - startOffset)
+            .pqCodebooksAndVectorsOffset(graphEndOffset)
+            .pqCodebooksAndVectorsLength(writer.position() - graphEndOffset)
+            .graphNodeIdToDocMap(graphNodeIdToDocMap)
+            .build();
+    }
+}
+```
+
+### 1.8.4 .data-jvector 文件的二进制布局
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Lucene Index Header                          │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Magic (4 bytes): 0x3FD76C17                              │   │
+│  │ Codec Name: "JVectorVectorsFormatIndex"                  │   │
+│  │ Version (4 bytes)                                        │   │
+│  │ Segment ID (16 bytes)                                    │   │
+│  │ Suffix                                                   │   │
+│  └─────────────────────────────────────────────────────────┘   │
+├─────────────────────────────────────────────────────────────────┤
+│                    OnDiskGraphIndex                             │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Graph Metadata:                                          │   │
+│  │   - dimension (4 bytes)                                  │   │
+│  │   - size (4 bytes): 节点数量                             │   │
+│  │   - maxDegree (4 bytes)                                  │   │
+│  │   - entryNode (4 bytes): 入口节点 ID                     │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │ Node 0:                                                  │   │
+│  │   - neighborCount (4 bytes)                              │   │
+│  │   - neighbors[] (neighborCount × 4 bytes)                │   │
+│  │   - [InlineVectors] vector data (dimension × 4 bytes)    │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │ Node 1:                                                  │   │
+│  │   - neighborCount                                        │   │
+│  │   - neighbors[]                                          │   │
+│  │   - vector data                                          │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │ ...                                                      │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │ Node N-1:                                                │   │
+│  │   - neighborCount                                        │   │
+│  │   - neighbors[]                                          │   │
+│  │   - vector data                                          │   │
+│  └─────────────────────────────────────────────────────────┘   │
+├─────────────────────────────────────────────────────────────────┤
+│                    PQ Codebooks & Vectors                       │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ ProductQuantization:                                     │   │
+│  │   - M (4 bytes): 子空间数量                              │   │
+│  │   - subvectorSize (4 bytes): 每个子空间的维度            │   │
+│  │   - clusterCount (4 bytes): 每个子空间的聚类数           │   │
+│  │   - globalCentroid (dimension × 4 bytes): 全局中心       │   │
+│  │   - codebooks[M][clusterCount][subvectorSize]: 码本      │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │ Compressed Vectors:                                      │   │
+│  │   - vector 0: [code_0, code_1, ..., code_{M-1}] (M bytes)│   │
+│  │   - vector 1: [code_0, code_1, ..., code_{M-1}]          │   │
+│  │   - ...                                                  │   │
+│  │   - vector N-1: [code_0, code_1, ..., code_{M-1}]        │   │
+│  └─────────────────────────────────────────────────────────┘   │
+├─────────────────────────────────────────────────────────────────┤
+│                    Lucene Footer                                │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Footer Magic (4 bytes): 0xC0DEC0DE                       │   │
+│  │ Algorithm ID (4 bytes): 0                                │   │
+│  │ Checksum (8 bytes): CRC32                                │   │
+│  └─────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 1.8.5 .meta-jvector 文件的结构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Lucene Index Header                          │
+├─────────────────────────────────────────────────────────────────┤
+│ Field 0 Metadata:                                               │
+│   - fieldNumber (4 bytes)                                       │
+│   - vectorEncoding (4 bytes): 0=BYTE, 1=FLOAT32                 │
+│   - similarityFunction (4 bytes): 0=EUCLIDEAN, 1=DOT, 2=COSINE  │
+│   - dimension (VInt)                                            │
+│   - vectorIndexOffset (VLong)                                   │
+│   - vectorIndexLength (VLong)                                   │
+│   - pqCodebooksOffset (VLong)                                   │
+│   - pqCodebooksLength (VLong)                                   │
+│   - degreeOverflow (4 bytes, float)                             │
+│   - GraphNodeIdToDocMap:                                        │
+│       - version (4 bytes)                                       │
+│       - size (VInt): ordinal 数量                               │
+│       - maxDocId (VInt)                                         │
+│       - mappings[size] (VInt each): ordinal → docId             │
+├─────────────────────────────────────────────────────────────────┤
+│ Field 1 Metadata:                                               │
+│   - ...                                                         │
+├─────────────────────────────────────────────────────────────────┤
+│ End Marker: -1 (4 bytes)                                        │
+├─────────────────────────────────────────────────────────────────┤
+│                    Lucene Footer                                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 1.9 GraphNodeIdToDocMap - ID 映射机制
+
+### 1.9.1 为什么需要 ID 映射？
+
+在 Lucene 中，每个文档有一个 `docId`，但：
+- 不是所有文档都有向量字段
+- `docId` 在段合并后会改变
+- jVector 图节点使用连续的 `ordinal`（0, 1, 2, ...）
+
+```
+示例场景:
+
+文档写入:
+  Doc 0: { "title": "A", "vector": [0.1, 0.2] }  → ordinal 0
+  Doc 1: { "title": "B" }                        → 无向量
+  Doc 2: { "title": "C", "vector": [0.3, 0.4] }  → ordinal 1
+  Doc 3: { "title": "D", "vector": [0.5, 0.6] }  → ordinal 2
+
+映射关系:
+  ordinal 0 → docId 0
+  ordinal 1 → docId 2
+  ordinal 2 → docId 3
+
+搜索时:
+  jVector 返回 ordinal 1 是最近邻
+  需要转换为 docId 2 返回给 Lucene
+```
+
+### 1.9.2 GraphNodeIdToDocMap 的实现
+
+```java
+public class GraphNodeIdToDocMap {
+    // 双向映射
+    private int[] graphNodeIdsToDocIds;  // ordinal → docId
+    private int[] docIdsToGraphNodeIds;  // docId → ordinal
+
+    // 构造函数：从 ordinal→docId 数组创建
+    public GraphNodeIdToDocMap(int[] graphNodeIdsToDocIds) {
+        this.graphNodeIdsToDocIds = graphNodeIdsToDocIds.clone();
+
+        // 构建反向映射
+        int maxDocId = Arrays.stream(graphNodeIdsToDocIds).max().getAsInt();
+        this.docIdsToGraphNodeIds = new int[maxDocId + 1];
+        Arrays.fill(docIdsToGraphNodeIds, -1);
+
+        for (int ord = 0; ord < graphNodeIdsToDocIds.length; ord++) {
+            int docId = graphNodeIdsToDocIds[ord];
+            if (docId != -1) {
+                docIdsToGraphNodeIds[docId] = ord;
+            }
+        }
+    }
+
+    // 搜索时使用：ordinal → docId
+    public int getLuceneDocId(int graphNodeId) {
+        return graphNodeIdsToDocIds[graphNodeId];
+    }
+
+    // 过滤时使用：docId → ordinal
+    public int getJVectorNodeId(int luceneDocId) {
+        return docIdsToGraphNodeIds[luceneDocId];
+    }
+}
+```
+
+### 1.9.3 段排序时的映射更新
+
+当 Lucene 对段进行排序（例如按时间戳排序）时，`docId` 会重新分配：
+
+```java
+public void update(Sorter.DocMap sortMap) {
+    int[] newGraphNodeIdsToDocIds = new int[graphNodeIdsToDocIds.length];
+    int[] newDocIdsToOrdinals = new int[maxNewDocId + 1];
+    Arrays.fill(newDocIdsToOrdinals, -1);
+
+    for (int oldDocId = 0; oldDocId < docIdsToGraphNodeIds.length; oldDocId++) {
+        int ord = docIdsToGraphNodeIds[oldDocId];
+        if (ord == -1) continue;
+
+        // 获取新的 docId
+        int newDocId = sortMap.oldToNew(oldDocId);
+
+        // 更新映射
+        newDocIdsToOrdinals[newDocId] = ord;
+        newGraphNodeIdsToDocIds[ord] = newDocId;
+    }
+
+    this.docIdsToGraphNodeIds = newDocIdsToOrdinals;
+    this.graphNodeIdsToDocIds = newGraphNodeIdsToDocIds;
+}
+```
+
+## 1.10 I/O 适配层
+
+### 1.10.1 为什么需要适配层？
+
+jVector 库定义了自己的 I/O 接口：
+- `RandomAccessReader`：随机读取
+- `IndexWriter`：顺序写入
+
+而 Lucene 使用：
+- `IndexInput`：输入流
+- `IndexOutput`：输出流
+
+适配层负责桥接这两套接口。
+
+### 1.10.2 JVectorIndexWriter - 写入适配
+
+```java
+public class JVectorIndexWriter implements IndexWriter {
+    private final IndexOutput indexOutputDelegate;  // Lucene 的输出流
+
+    public JVectorIndexWriter(IndexOutput delegate) {
+        this.indexOutputDelegate = delegate;
+    }
+
+    @Override
+    public void writeInt(int v) throws IOException {
+        indexOutputDelegate.writeInt(v);  // 直接委托
+    }
+
+    @Override
+    public void writeFloat(float v) throws IOException {
+        // float 转 int 位模式再写入
+        indexOutputDelegate.writeInt(Float.floatToIntBits(v));
+    }
+
+    @Override
+    public long position() throws IOException {
+        return indexOutputDelegate.getFilePointer();
+    }
+
+    // ... 其他方法类似
+}
+```
+
+### 1.10.3 JVectorRandomAccessReader - 读取适配
+
+```java
+public class JVectorRandomAccessReader implements RandomAccessReader {
+    private final IndexInput indexInputDelegate;  // Lucene 的输入流
+
+    @Override
+    public void seek(long offset) throws IOException {
+        indexInputDelegate.seek(offset);
+    }
+
+    @Override
+    public int readInt() throws IOException {
+        return indexInputDelegate.readInt();
+    }
+
+    @Override
+    public void readFully(byte[] bytes) throws IOException {
+        indexInputDelegate.readBytes(bytes, 0, bytes.length);
+    }
+
+    // Supplier 模式：支持多线程并发读取
+    public static class Supplier implements ReaderSupplier {
+        private final IndexInput currentInput;
+
+        @Override
+        public RandomAccessReader get() throws IOException {
+            // 克隆输入流，每个线程独立的读取位置
+            IndexInput clone = currentInput.clone();
+            return new JVectorRandomAccessReader(clone);
+        }
+    }
+}
+```
+
+## 1.11 完整的 Flush 流程图
+
+```
+                    ┌─────────────────┐
+                    │  Lucene 触发    │
+                    │    Flush        │
+                    └────────┬────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │ JVectorWriter   │
+                    │   .flush()      │
+                    └────────┬────────┘
+                             │
+              ┌──────────────┼──────────────┐
+              │              │              │
+              ▼              ▼              ▼
+        ┌──────────┐  ┌──────────┐  ┌──────────┐
+        │ Field 0  │  │ Field 1  │  │ Field N  │
+        └────┬─────┘  └────┬─────┘  └────┬─────┘
+             │              │              │
+             ▼              ▼              ▼
+    ┌────────────────────────────────────────────┐
+    │           对每个字段执行:                   │
+    │                                            │
+    │  1. 检查向量数量                           │
+    │     └─ >= 阈值? → 计算 PQ 码本             │
+    │     └─ < 阈值?  → 使用原始向量             │
+    │                                            │
+    │  2. 构建 ordinal→docId 映射                │
+    │     └─ GraphNodeIdToDocMap                 │
+    │                                            │
+    │  3. 并行构建 HNSW 图                       │
+    │     └─ GraphIndexBuilder                   │
+    │     └─ ForkJoinPool 并行插入               │
+    │     └─ cleanup() 优化图结构                │
+    │                                            │
+    │  4. 写入磁盘                               │
+    │     ├─ .data-jvector:                      │
+    │     │   └─ OnDiskGraphIndex                │
+    │     │   └─ InlineVectors (原始向量)        │
+    │     │   └─ PQ 码本 + 压缩向量              │
+    │     │                                      │
+    │     ├─ .neighbors-score-cache-jvector:     │
+    │     │   └─ OnHeapGraphIndex 序列化         │
+    │     │                                      │
+    │     └─ .meta-jvector:                      │
+    │         └─ 字段元数据                      │
+    │         └─ 偏移量信息                      │
+    │         └─ ID 映射                         │
+    └────────────────────────────────────────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │  finish()       │
+                    │  写入结束标记   │
+                    │  写入 Footer    │
+                    └─────────────────┘
+```
+
+
+## 1.12 段合并（Merge）流程详解
+
+### 1.12.1 什么是段合并？
+
+Lucene 采用 LSM-Tree 类似的架构，写入时先创建小段，后台逐渐合并成大段：
+
+```
+时间线:
+─────────────────────────────────────────────────────────────────►
+
+写入 1000 文档 → Segment_0 (1000 docs)
+写入 1000 文档 → Segment_1 (1000 docs)
+写入 1000 文档 → Segment_2 (1000 docs)
+                    │
+                    ▼ 触发合并
+              Segment_0_1_2 (3000 docs)
+
+写入 1000 文档 → Segment_3 (1000 docs)
+写入 1000 文档 → Segment_4 (1000 docs)
+                    │
+                    ▼ 触发合并
+              Segment_0_1_2_3_4 (5000 docs)
+```
+
+### 1.12.2 传统合并 vs 增量合并
+
+**传统方式（Lucene HNSW）：**
+每次合并都要从头重建整个图，时间复杂度 O(N log N)
+
+```
+Segment A (10000 vectors) + Segment B (1000 vectors)
+                    │
+                    ▼
+        从 11000 个向量重新构建图
+        时间: ~11000 × log(11000) 次操作
+```
+
+**jVector 增量合并：**
+复用最大段的图，只插入新向量，时间复杂度 O(M log N)，M << N
+
+```
+Segment A (10000 vectors) + Segment B (1000 vectors)
+                    │
+                    ▼
+        加载 Segment A 的图到内存
+        只插入 Segment B 的 1000 个向量
+        时间: ~1000 × log(11000) 次操作
+
+加速比: 11000/1000 = 11x
+```
+
+### 1.12.3 mergeOneField() 方法详解
+
+```java
+@Override
+public void mergeOneField(FieldInfo fieldInfo, MergeState mergeState) throws IOException {
+    switch (fieldInfo.getVectorEncoding()) {
+        case FLOAT32:
+            // 创建合并视图，统一访问所有段的向量
+            RandomAccessMergedFloatVectorValues mergeRavv =
+                new RandomAccessMergedFloatVectorValues(fieldInfo, mergeState);
+            mergeRavv.merge();
+            break;
+        case BYTE:
+            throw new UnsupportedEncodingException("不支持 byte 向量");
+    }
+}
+```
+
+### 1.12.4 RandomAccessMergedFloatVectorValues - 合并视图
+
+这个类提供了一个统一的视图，让我们可以像访问单个段一样访问多个段的向量：
+
+```java
+class RandomAccessMergedFloatVectorValues implements RandomAccessVectorValues {
+
+    // 核心数据结构
+    private final KnnVectorsReader[] readers;           // 各段的 reader
+    private final int[][] ravvOrdToReaderMapping;       // 全局 ordinal → [段索引, 段内 ordinal]
+    private final GraphNodeIdToDocMap graphNodeIdToDocMap;  // 图节点 → 新 docId
+
+    public RandomAccessMergedFloatVectorValues(FieldInfo fieldInfo, MergeState mergeState) {
+        // 1. 找到最大的段作为 leading reader
+        int leadingReaderIdx = findLargestSegment(mergeState);
+
+        // 2. 将 leading reader 交换到第一位
+        swapToFirst(leadingReaderIdx);
+
+        // 3. 构建全局 ordinal 映射
+        buildOrdinalMapping();
+
+        // 4. 构建 graphNodeId → docId 映射
+        buildDocIdMapping(mergeState.docMaps);
+    }
+
+    @Override
+    public VectorFloat<?> getVector(int globalOrd) {
+        // 根据全局 ordinal 找到对应的段和段内 ordinal
+        int readerIdx = ravvOrdToReaderMapping[globalOrd][0];
+        int localOrd = ravvOrdToReaderMapping[globalOrd][1];
+
+        // 从对应段读取向量
+        return perReaderFloatVectorValues[readerIdx].vectorFloatValue(localOrd);
+    }
+}
+```
+
+**映射关系示意图：**
+
+```
+Segment 0 (Leading):     Segment 1:           Segment 2:
+┌─────────────────┐     ┌─────────────────┐  ┌─────────────────┐
+│ local_ord │ vec │     │ local_ord │ vec │  │ local_ord │ vec │
+├───────────┼─────┤     ├───────────┼─────┤  ├───────────┼─────┤
+│     0     │ v0  │     │     0     │ v3  │  │     0     │ v5  │
+│     1     │ v1  │     │     1     │ v4  │  │     1     │ v6  │
+│     2     │ v2  │     └───────────┴─────┘  └───────────┴─────┘
+└───────────┴─────┘
+
+全局映射 ravvOrdToReaderMapping:
+┌────────────┬─────────────┬───────────┐
+│ global_ord │ reader_idx  │ local_ord │
+├────────────┼─────────────┼───────────┤
+│     0      │      0      │     0     │  → v0
+│     1      │      0      │     1     │  → v1
+│     2      │      0      │     2     │  → v2
+│     3      │      1      │     0     │  → v3
+│ 4      │      1      │     1     │  → v4
+│     5      │      2      │     0     │  → v5
+│     6      │      2      │     1     │  → v6
+└────────────┴─────────────┴───────────┘
+```
+
+### 1.12.5 merge() 方法 - 合并策略选择
+
+```java
+public void merge() throws IOException {
+    // 获取 leading reader 的 PQ 信息
+    JVectorReader leadingReader = getLeadingReader();
+    Optional<ProductQuantization> existingPQ =
+        leadingReader.getProductQuantizationForField(fieldName);
+
+    // ========== 决定 PQ 策略 ==========
+    PQVectors compactPqVectors;
+
+    if (existingPQ.isEmpty()) {
+        // 没有现有 PQ
+        if (totalLiveVectorsCount >= minimumBatchSizeForQuantization) {
+            // 向量够多，创建新的 PQ
+            compactPqVectors = getPQVectors(compactRavv, fieldInfo);
+        } else {
+            // 向量太少，不使用 PQ
+            compactPqVectors = null;
+        }
+    } else {
+        // 有现有 PQ，用新向量精炼码本
+        ProductQuantization pq = existingPQ.get();
+        for (int i = 1; i < readers.length; i++) {
+            pq.refine(readers[i].getFloatVectorValues(fieldName));
+        }
+        compactPqVectors = PQVectors.encodeAndBuild(pq, ...);
+    }
+
+    // ========== 决定图构建策略 ==========
+    if (compactPqVectors == null) {
+        // 无 PQ，尝试增量合并
+        boolean ok = tryLeadingSegmentMerge();
+        if (!ok) {
+            // 增量合并失败，从头构建
+            buildGraphFromScratch();
+        }
+    } else {
+        // 有 PQ，必须从头构建（PQ 编码变了）
+        buildGraphFromScratch();
+    }
+}
+```
+
+### 1.12.6 tryLeadingSegmentMerge() - 增量合并
+
+```java
+private boolean tryLeadingSegmentMerge() throws IOException {
+    // ========== 检查是否可以增量合并 ==========
+
+    // 1. 配置是否禁用
+    if (leadingSegmentMergeDisabled) {
+        return false;
+    }
+
+    // 2. 检查 ordinal 空间是否会溢出
+    long heapOrdUpperBound = leadingGraphIdUpperBound + totalLiveVectorsInOtherReaders;
+    if (heapOrdUpperBound > IndexWriter.MAX_DOCS) {
+        log.warn("ordinal 空间可能溢出，跳过增量合并");
+        return false;
+    }
+
+    // 3. 检查图的稀疏度（太多删除会导致 ordinal 稀疏）
+    double density = totalLiveVectorsCount / (double) heapOrdUpperBound;
+    if (density < MIN_HEAP_GRAPH_ORDINAL_DENSITY) {  // 0.4
+        log.warn("图太稀疏 ({} < 0.4)，跳过增量合并", density);
+        return false;
+    }
+
+    // ========== 执行增量合并 ==========
+
+    // 1. 加载 leading segment 的图到内存
+    OnHeapGraphIndex leadingGraph = OnHeapGraphIndex.load(
+        leadingReader.getNeighborsScoreCacheForField(fieldName),
+        dimension,
+        degreeOverflow,
+        diversityProvider
+    );
+
+    // 2. 创建图构建器，基于现有图
+    GraphIndexBuilder builder = new GraphIndexBuilder(
+        buildScoreProvider,
+        dimension,
+        leadingGraph,      // 传入现有图！
+        beamWidth,
+        degreeOverflow,
+        alpha,
+        true,
+        SIMD_POOL_MERGE,
+        PARALLELISM_POOL
+    );
+
+    // 3. 并行插入其他段的向量
+    SIMD_POOL_MERGE.submit(() ->
+        IntStream.range(leadingGraph.getIdUpperBound(), heapRavv.size())
+            .parallel()
+            .forEach(ord -> {
+                builder.addGraphNode(ord, vv.get().getVector(ord));
+            })
+    ).join();
+
+    // 4. 标记已删除的节点
+    for (int i = 0; i < numBaseVectors; i++) {
+        if (!liveGraphNodesPerReader[LEADING_READER_IDX].get(i)) {
+            builder.markNodeDeleted(midToHeapOrds[i]);
+        }
+    }
+
+    // 5. 清理图结构
+    builder.cleanup();
+
+    // 6. 写入磁盘
+    writeField(fieldInfo, heapRavv, null, finalOrdToDocMap, graph);
+
+    return true;
+}
+```
+
+### 1.12.7 增量合并的数据流
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    合并前的段                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Segment A (Leading, 10000 vectors):                            │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │ .data-jvector: OnDiskGraphIndex + Vectors               │    │
+│  │ .neighbors-score-cache-jvector: OnHeapGraphIndex 缓存   │ ←──┼── 关键！
+│  │ .meta-jvector: 元数据                                   │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                  │
+│  Segment B (1000 vectors):                                      │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │ .data-jvector: OnDiskGraphIndex + Vectors               │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    增量合并过程                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  1. 从 .neighbors-score-cache-jvector 加载 OnHeapGraphIndex     │
+│     ┌─────────────────────────────────────────────────────┐     │
+│     │  OnHeapGraphIndex (内存中)                          │     │
+│     │  - 10000 个节点                                     │     │
+│     │  - 每个节点的邻居列表                               │     │
+│     │  - 每个节点的邻居分数缓存                           │     │
+│     └─────────────────────────────────────────────────────┘     │
+│                              │                                   │
+│  2. 并行插入 Segment B 的向量                                   │
+│     ┌─────────────────────────────────────────────────────┐     │
+│     │  for each vector in Segment B:                      │     │
+│     │    builder.addGraphNode(ord, vector)                │     │
+│     │    - 搜索最近邻                                     │     │
+│     │    - 建立双向连接                                   │     │
+│     │    - 更新邻居分数缓存                               │     │
+│     └─────────────────────────────────────────────────────┘     │
+│                              │                                   │
+│  3. 处理删除                                                    │
+│     ┌─────────────────────────────────────────────────────┐     │
+│     │  for each deleted doc:                              │     │
+│     │    builder.markNodeDeleted(ord)                     │     │
+│     └─────────────────────────────────────────────────────┘     │
+│                              │                                   │
+│  4. cleanup() 优化图结构                                        │
+│     - 移除指向已删除节点的边                                    │
+│     - 重新平衡邻居连接                                          │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    合并后的新段                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  New Segment (11000 vectors):                                   │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │ .data-jvector: 新的 OnDiskGraphIndex + 所有向量         │    │
+│  │ .neighbors-score-cache-jvector: 新的 OnHeapGraphIndex   │    │
+│  │ .meta-jvector: 更新的元数据和 ID 映射                   │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 1.12.8 为什么需要 neighbors-score-cache？
+
+增量合并的关键是能够快速修改现有图。`OnDiskGraphIndex` 是只读的，无法修改。所以我们需要：
+
+1. **写入时**：同时保存 `OnHeapGraphIndex` 到 `.neighbors-score-cache-jvector`
+2. **合并时**：从缓存加载 `OnHeapGraphIndex`，在内存中修改
+3. **写入新段**：将修改后的图写入新的 `.data-jvector`
+
+```
+OnDiskGraphIndex (磁盘，只读):
+- 紧凑的二进制格式
+- 支持 mmap 随机访问
+- 搜索时使用
+
+OnHeapGraphIndex (内存，可修改):
+- 支持添加/删除节点
+- 支持修改邻居连接
+- 合并时使用
+```
+
+## 1.13 线程池与并行化
+
+### 1.13.1 jVector 使用的线程池
+
+```java
+public class JVectorFormat extends KnnVectorsFormat {
+    // SIMD 优化的计算线程池（用于向量距离计算）
+    public static final ForkJoinPool SIMD_POOL_MERGE = getPhysicalCoreExecutor();
+    public static final ForkJoinPool SIMD_POOL_FLUSH = getPhysicalCoreExecutor();
+
+    // 通用并行线程池
+    public static final ForkJoinPool PARALLELISM_POOL = ForkJoinPool.commonPool();
+
+    private static ForkJoinPool getPhysicalCoreExecutor() {
+        // 使用物理核心数（而非逻辑核心数）
+        // 因为 SIMD 操作受限于物理执行单元
+        int physicalCores = Runtime.getRuntime().availableProcessors() / 2;
+        return new ForkJoinPool(physicalCores, ...);
+    }
+}
+```
+
+### 1.13.2 为什么分开 Flush 和 Merge 的线程池？
+
+```
+场景: 用户正在写入数据，同时后台在合并
+
+如果共用线程池:
+┌─────────────────────────────────────────────────────────────┐
+│ 共享线程池 (8 线程)                                         │
+│                                                              │
+│ Flush 任务: ████████████████████████████████ (占用全部)     │
+│ Merge 任务: 等待...                                         │
+│                                                              │
+│ 问题: Merge 被 Flush 阻塞，或反过来                         │
+└─────────────────────────────────────────────────────────────┘
+
+分开线程池:
+┌─────────────────────────────────────────────────────────────┐
+│ SIMD_POOL_FLUSH (4 线程)                                    │
+│ Flush 任务: ████████████████                                │
+├─────────────────────────────────────────────────────────────┤
+│ SIMD_POOL_MERGE (4 线程)                                    │
+│ Merge 任务: ████████████████                                │
+│                                                              │
+│ 优点: Flush 和 Merge 互不干扰                               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## 1.14 小结
+
+本章详细介绍了 opensearch-jvector 插件的写入流程，核心要点：
+
+1. **Codec 机制**：通过 Lucene 的 Codec SPI，只替换 `KnnVectorsFormat`，复用其他所有基础设施
+
+2. **写入流程**：
+   - `addField()` → 注册字段
+   - `addValue()` → 累积向量到内存
+   - `flush()` → 构建图 + 持久化
+
+3. **PQ 量化**：
+   - 将高维向量分割成子空间
+   - 每个子空间独立聚类
+   - 用聚类编号代替原始数据
+   - 压缩比可达 16-64 倍
+
+4. **HNSW 图构建**：
+   - 多层图结构
+   - jVector 支持并行构建（Lucene 不支持）
+   - 使用 Vamana 多样性剪枝
+
+5. **增量合并**：
+   - 复用最大段的图
+   - 只插入新向量
+   - 通过 neighbors-score-cache 实现
+   - 大幅减少合并时间
+
+6. **ID 映射**：
+   - `GraphNodeIdToDocMap` 维护 ordinal ↔ docId 映射
+   - 支持段排序和合并时的映射更新
+
+7. **存储格式**：
+   - `.meta-jvector`：元数据
+   - `.data-jvector`：图索引 + 向量 + PQ 数据
+   - `.neighbors-score-cache-jvector`：增量合并缓存
+
